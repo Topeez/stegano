@@ -1,6 +1,49 @@
-export const HEADER_BYTES = 10;
+export const HEADER_BYTES = 11;
+export const FLAG_ENCRYPTED = 1;
 const MAGIC_0 = 0x53;
 const MAGIC_1 = 0x54;
+
+export function embedBytes(
+  rgba: Uint8Array, width: number, height: number, payload: Uint8Array, flags = 0,
+): Uint8Array {
+  if (payload.length > capacityBytes(width, height)) throw new Error("Zpráva je příliš dlouhá.");
+
+  const data = new Uint8Array(HEADER_BYTES + payload.length);
+  const view = new DataView(data.buffer);
+  data[0] = MAGIC_0;
+  data[1] = MAGIC_1;
+  data[2] = flags;
+  view.setUint32(3, payload.length, false);
+  view.setUint32(7, crc32(payload), false);
+  data.set(payload, HEADER_BYTES);
+
+  const out = rgba.slice();
+  const totalBits = data.length * 8;
+  let bit = 0;
+  for (let p = 0; p < out.length && bit < totalBits; p += 4) {
+    for (let c = 0; c < 3 && bit < totalBits; c++, bit++) {
+      out[p + c] = (out[p + c] & 0xfe) | ((data[bit >> 3] >> (7 - (bit & 7))) & 1);
+    }
+  }
+  return out;
+}
+
+export function extractBytes(
+  rgba: Uint8Array, width: number, height: number,
+): { payload: Uint8Array; flags: number } {
+  const header = readBytes(rgba, 0, HEADER_BYTES);
+  if (header[0] !== MAGIC_0 || header[1] !== MAGIC_1) throw new Error("V obrázku nebyla nalezena žádná zpráva.");
+
+  const view = new DataView(header.buffer);
+  const flags = header[2];
+  const length = view.getUint32(3, false);
+  const expectedCrc = view.getUint32(7, false);
+  if (length === 0 || length > capacityBytes(width, height)) throw new Error("Hlavička zprávy je neplatná.");
+
+  const payload = readBytes(rgba, HEADER_BYTES, length);
+  if (crc32(payload) !== expectedCrc) throw new Error("Zpráva je poškozená (nesedí kontrolní součet).");
+  return { payload, flags };
+}
 
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -13,7 +56,7 @@ const CRC_TABLE = (() => {
 })();
 
 export function crc32(bytes: Uint8Array): number {
-  let c = 0xffffffff;
+  let c = 0xffffffff; // nejvyssi mozny 32bit cislo v hex soustave
   for(let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
@@ -29,34 +72,11 @@ export function utf8Encode(text: string): Uint8Array {
   return Uint8Array.from(bin, (c) => c.charCodeAt(0));
 }
 
-function utf8Decode(bytes: Uint8Array): string {
+export function utf8Decode(bytes: Uint8Array): string {
   const escaped = Array.from(bytes, (b) => "%" + b.toString(16).padStart(2, "0")).join("");
   return decodeURIComponent(escaped);
 }
 
-export function embedMessage(rgba: Uint8Array, width: number, height: number, message: string): Uint8Array {
-  const payload = utf8Encode(message);
-  if (payload.length > capacityBytes(width, height)) throw new Error("Zpráva je příliš dlouhá.");
-
-  const data = new Uint8Array(HEADER_BYTES + payload.length);
-  const view = new DataView(data.buffer);
-  data[0] = MAGIC_0;
-  data[1] = MAGIC_1;
-  view.setUint32(2, payload.length, false);
-  view.setUint32(6, crc32(payload), false);
-  data.set(payload, HEADER_BYTES);
-
-  const out = rgba.slice();
-  const totalBits = data.length * 8;
-  let bit = 0;
-
-  for (let p = 0; p < out.length && bit < totalBits; p += 4) {
-    for (let c = 0; c < 3 && bit < totalBits; c++, bit++) {
-      out[p + c] = (out[p + c] & 0xfe) | ((data[bit >> 3] >> (7 - (bit & 7))) & 1);
-    }
-  }
-  return out;
-}
 
 function readBytes(rgba: Uint8Array, byteOffset: number, count: number): Uint8Array {
   const out = new Uint8Array(count);
@@ -74,31 +94,6 @@ function readBytes(rgba: Uint8Array, byteOffset: number, count: number): Uint8Ar
   return out;
 }
 
-export function extractMessage(rgba: Uint8Array, width: number, height: number): string {
-  const header = readBytes(rgba, 0, HEADER_BYTES);
-  if(header[0] !== MAGIC_0 || header[1] !== MAGIC_1) {
-    throw new Error("V obrázku nebyla nalezena žádná zpráva.")
-  }
-
-  const view = new DataView(header.buffer);
-  const length = view.getUint32(2, false);
-  const expectedCrc = view.getUint32(6, false);
-
-  if(length === 0 || length > capacityBytes(width, height)) {
-    throw new Error("Hlavička zprávy je neplatná.");
-  }
-
-  const payload = readBytes(rgba, HEADER_BYTES, length);
-  if(crc32(payload) !== expectedCrc) {
-    throw new Error("Zpráva je poškozená (nesedí kontrolní součet).");
-  }
-
-  try {
-    return utf8Decode(payload);
-  } catch {
-    throw new Error("Data v obrázku nesjou platný text.");
-  }
-}
 
 export function psnr(a: Uint8Array, b: Uint8Array): number {
   let sum = 0;

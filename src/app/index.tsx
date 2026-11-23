@@ -26,18 +26,23 @@ import { ThemedText } from "@/components/themed-text";
 import { ThemedView } from "@/components/themed-view";
 import { Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
+import { decryptBytes, encryptBytes } from "@/lib/crypto-layer";
 import {
   capacityBytes,
   diffMap,
-  embedMessage,
-  extractMessage,
+  embedBytes,
+  extractBytes,
+  FLAG_ENCRYPTED,
   lsbPlane,
   makeTestMessage,
   psnr,
+  utf8Decode,
   utf8Encode,
 } from "@/lib/stego-core";
 import { decodeImage, encodePng, type DecodedImage } from "@/lib/stego-image";
 import { useThemeStore } from "@/store/theme-store";
+
+const CRYPTO_OVERHEAD = 44; // sůl 16 + nonce 12 + tag 16
 
 type Mode = "embed" | "extract";
 type View_ = "output" | "diff" | "lsb";
@@ -77,6 +82,7 @@ export default function HomeScreen() {
     const [image, setImage] = useState<DecodedImage | null>(null);
     const [details, setDetails] = useState<Details | null>(null);
     const [message, setMessage] = useState("");
+    const [password, setPassword] = useState("");
     const [result, setResult] = useState<Result | null>(null);
     const [resultView, setResultView] = useState<View_>("output");
     const [extracted, setExtracted] = useState("");
@@ -96,7 +102,8 @@ export default function HomeScreen() {
         () => (image ? capacityBytes(image.width, image.height) : 0),
         [image],
     );
-    const messageBytes = useMemo(() => utf8Encode(message).length, [message]);
+    const plain = useMemo(() => utf8Encode(message), [message]);
+    const messageBytes = plain.length + (password ? CRYPTO_OVERHEAD : 0);
     const ratio = capacity > 0 ? messageBytes / capacity : 0;
 
     const isLarge = message.length > 20000;
@@ -111,14 +118,14 @@ export default function HomeScreen() {
         if (res.canceled) return;
 
         try {
-            await stage("Načítám obrázek...", 0.2);
+            await stage("Načítám obrázek…", 0.2);
             const uri = res.assets[0].uri;
             const base64 = await FileSystem.readAsStringAsync(uri, {
                 encoding: FileSystem.EncodingType.Base64,
             });
             const info = await FileSystem.getInfoAsync(uri);
 
-            await stage("Dekóduji pixely...", 0.6);
+            await stage("Dekóduji pixely…", 0.6);
             const decoded = decodeImage(base64);
 
             setImage(decoded);
@@ -139,25 +146,32 @@ export default function HomeScreen() {
     const runEmbed = async () => {
         if (!image) return;
         try {
-            await stage("Vkládám zprávu do pixelů…", 0.1);
-            const out = embedMessage(
+            let payload = plain;
+            if (password) {
+                await stage("Šifruji zprávu…", 0.05);
+                payload = await encryptBytes(password, plain);
+            }
+
+            await stage("Vkládám zprávu do pixelů…", 0.2);
+            const out = embedBytes(
                 image.pixels,
                 image.width,
                 image.height,
-                message,
+                payload,
+                password ? FLAG_ENCRYPTED : 0,
             );
 
-            await stage("Počítám rozdílovou mapu…", 0.35);
+            await stage("Počítám rozdílovou mapu…", 0.4);
             const diff = diffMap(image.pixels, out);
             const quality = psnr(image.pixels, out);
 
-            await stage("Kóduji výsledný PNG…", 0.55);
+            await stage("Kóduji výsledný PNG…", 0.6);
             const output = encodePng(out, image.width, image.height);
 
-            await stage("Vytvářím náhled rozdílů…", 0.75);
+            await stage("Vytvářím náhled rozdílů…", 0.78);
             const diffPng = encodePng(diff.pixels, image.width, image.height);
 
-            await stage("Vytvářím LSB rovinu…", 0.9);
+            await stage("Vytvářím LSB rovinu…", 0.92);
             const lsb = encodePng(lsbPlane(out), image.width, image.height);
 
             setResult({
@@ -182,15 +196,31 @@ export default function HomeScreen() {
     const runExtract = async () => {
         if (!image) return;
         try {
-            await stage("Čtu bity z obrázku…", 0.5);
+            await stage("Čtu bity z obrázku…", 0.3);
+            const { payload, flags } = extractBytes(
+                image.pixels,
+                image.width,
+                image.height,
+            );
 
-            const msg = extractMessage(image.pixels, image.width, image.height);
+            let bytes = payload;
+            if (flags & FLAG_ENCRYPTED) {
+                if (!password) {
+                    throw new Error("Zpráva je šifrovaná, zadej heslo.");
+                }
+                await stage("Dešifruji…", 0.6);
+                bytes = await decryptBytes(password, payload);
+            }
+
+            await stage("Dekóduji text…", 0.9);
+            const msg = utf8Decode(bytes);
             const ok = msg.endsWith("[KONEC]")
                 ? "✓ konec zprávy sedí"
                 : "✗ konec chybí";
+            const head = msg.length > 300 ? `${msg.slice(0, 300)}…` : msg;
 
             setExtracted(
-                `${msg.slice(0, 300)}…\n\n${msg.length.toLocaleString("cs-CZ")} znaků · ${ok}`,
+                `${head}\n\n${msg.length.toLocaleString("cs-CZ")} znaků · ${ok}`,
             );
             Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         } catch (e) {
@@ -214,8 +244,10 @@ export default function HomeScreen() {
         try {
             await stage("Ukládám do galerie…", 0.4);
             const perm = await MediaLibrary.requestPermissionsAsync(true);
-            if (!perm.granted)
+            if (!perm.granted) {
+                setLoading(null);
                 return Alert.alert("Chybí oprávnění ke galerii.");
+            }
             await MediaLibrary.saveToLibraryAsync(await writeResult());
             setLoading(null);
             Alert.alert("Uloženo", "PNG je v galerii.");
@@ -237,10 +269,23 @@ export default function HomeScreen() {
               : result.lsb
         : null;
 
+    const inputStyle = [
+        styles.input,
+        {
+            color: theme.text,
+            backgroundColor: theme.backgroundElement,
+            borderColor: theme.border,
+        },
+    ];
+
     return (
         <ThemedView style={styles.flex}>
             <SafeAreaView style={styles.flex}>
-                <ScrollView contentContainerStyle={styles.content}>
+                <ScrollView
+                    contentContainerStyle={styles.content}
+                    scrollEnabled={!busy}
+                    keyboardShouldPersistTaps="handled"
+                >
                     <LinearGradient
                         colors={theme.gradient}
                         start={{ x: 0, y: 0 }}
@@ -336,13 +381,28 @@ export default function HomeScreen() {
                         </ThemedView>
                     )}
 
+                    <TextInput
+                        value={password}
+                        onChangeText={setPassword}
+                        placeholder={
+                            mode === "embed"
+                                ? "Heslo (volitelné, zapne šifrování)"
+                                : "Heslo (pokud je zpráva šifrovaná)"
+                        }
+                        placeholderTextColor={theme.textSecondary}
+                        secureTextEntry
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                        style={[inputStyle, styles.password]}
+                    />
+
                     {mode === "embed" ? (
                         <>
                             <View style={styles.row}>
                                 {[0.1, 0.25, 0.5].map((p) => (
                                     <Pressable
                                         key={p}
-                                        disabled={!image}
+                                        disabled={!image || busy}
                                         onPress={() => fillTest(p)}
                                         style={[
                                             styles.chip,
@@ -354,7 +414,7 @@ export default function HomeScreen() {
                                         ]}
                                     >
                                         <ThemedText bold>
-                                            {p * 100} %
+                                            {Math.round(p * 100)} %
                                         </ThemedText>
                                     </Pressable>
                                 ))}
@@ -362,27 +422,33 @@ export default function HomeScreen() {
                             <TextInput
                                 value={
                                     isLarge
-                                        ? `${message.slice(0, 200)}…\n(${messageBytes.toLocaleString("cs-CZ")} B vygenerováno)`
+                                        ? `${message.slice(0, 200)}…\n(${plain.length.toLocaleString("cs-CZ")} B vygenerováno)`
                                         : message
                                 }
                                 onChangeText={setMessage}
                                 editable={!isLarge}
                                 multiline
-                                style={[
-                                    styles.input,
-                                    {
-                                        color: theme.text,
-                                        backgroundColor:
-                                            theme.backgroundElement,
-                                        borderColor: theme.border,
-                                    },
-                                ]}
+                                placeholder="Zpráva k ukrytí…"
+                                placeholderTextColor={theme.textSecondary}
+                                style={inputStyle}
                             />
+                            {isLarge && (
+                                <ThemedButton
+                                    title="Vymazat zprávu"
+                                    icon="trash-outline"
+                                    variant="secondary"
+                                    onPress={() => setMessage("")}
+                                />
+                            )}
                             <View style={{ gap: Spacing.two }}>
                                 <CapacityBar ratio={ratio} />
                                 <ThemedText secondary>
-                                    {messageBytes} / {capacity} B (
+                                    {messageBytes.toLocaleString("cs-CZ")} /{" "}
+                                    {capacity.toLocaleString("cs-CZ")} B (
                                     {Math.min(100, ratio * 100).toFixed(1)} %)
+                                    {password
+                                        ? ` · vč. ${CRYPTO_OVERHEAD} B šifrování`
+                                        : ""}
                                 </ThemedText>
                             </View>
                             <ThemedButton
@@ -448,7 +514,7 @@ export default function HomeScreen() {
                                 icon="lock-open-outline"
                                 variant="accent"
                                 onPress={runExtract}
-                                disabled={!image}
+                                disabled={!image || busy}
                             />
                             <TextInput
                                 value={extracted}
@@ -456,21 +522,13 @@ export default function HomeScreen() {
                                 multiline
                                 placeholder="Zde se zobrazí ukrytá zpráva"
                                 placeholderTextColor={theme.textSecondary}
-                                style={[
-                                    styles.input,
-                                    {
-                                        color: theme.text,
-                                        backgroundColor:
-                                            theme.backgroundElement,
-                                        borderColor: theme.border,
-                                    },
-                                ]}
+                                style={inputStyle}
                             />
                         </>
                     )}
                 </ScrollView>
             </SafeAreaView>
-            {snow && <Snowfall />}
+            {snow && <Snowfall count={50} />}
             {loading && (
                 <LoadingOverlay
                     label={loading.label}
@@ -507,6 +565,7 @@ const styles = StyleSheet.create({
         textAlignVertical: "top",
         fontSize: 15,
     },
+    password: { minHeight: 0, textAlignVertical: "center" },
     row: { flexDirection: "row", gap: Spacing.two },
     stat: {
         flex: 1,
